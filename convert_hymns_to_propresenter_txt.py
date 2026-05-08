@@ -1,16 +1,9 @@
-
 #!/usr/bin/env python3
-"""
-把「新聖詩歌詞」.docx 轉成 ProPresenter 可逐首匯入的 .txt 檔案。
+"""Convert 新聖詩 DOCX/PPTX files into ProPresenter-importable TXT files.
 
-使用方式：
-  1. 把此檔案放在含有「新聖詩歌詞1-300.docx」與「新聖詩歌詞301-650.docx」的資料夾。
-  2. 在終端機執行：
-       python3 convert_hymns_to_propresenter_txt.py
-  3. 轉出的檔案會在「ProPresenter_單首TXT」資料夾。
-
-ProPresenter 匯入文字檔時，通常會用「空白行」分隔投影片；
-此程式預設會把每一節歌詞做成一張投影片。
+Each output file is named `新聖詩N首.txt`, and the first line inside the
+file is the same title without any leading zero before the hymn number.
+Slides are separated by blank lines for ProPresenter text import.
 """
 
 from __future__ import annotations
@@ -18,295 +11,305 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import unicodedata
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-from zipfile import ZipFile
 from xml.etree import ElementTree as ET
 
+NS = {
+    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+    "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
+}
 
-# WordprocessingML namespace
-W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-NS = {"w": W_NS}
+HYMNV_RE = re.compile(r"新聖詩\s*0*(\d+)\s*首")
+FOOTER_RE = re.compile(r"新聖詩\s*\d+\s*首")
+SLIDE_RE = re.compile(r"slide(\d+)\.xml$")
+DOCX_HEADING_RE = re.compile(r"^(\d{3})(.*)$")
+W_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
-DEFAULT_INPUTS = ["新聖詩歌詞1-300.docx", "新聖詩歌詞301-650.docx"]
-DEFAULT_OUTPUT = "ProPresenter_單首TXT"
+
+@dataclass(frozen=True)
+class TextBox:
+    index: int
+    y: int
+    paragraphs: list[str]
 
 
 @dataclass
 class Song:
     number: int
-    title: str
     lines: list[str]
 
     @property
-    def display_title(self) -> str:
+    def title(self) -> str:
         return f"新聖詩{self.number}首"
 
 
-def normalize_text(text: str) -> str:
-    """Normalize spaces and common punctuation without changing Chinese/Taiwanese text."""
-    text = unicodedata.normalize("NFKC", text)
-    text = text.replace("\u3000", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+def normalize_line(text: str) -> str:
+    """Normalize whitespace while preserving hymn text."""
+    return re.sub(r"[ \t\u3000]+", " ", text).strip()
 
 
-def paragraph_text(p: ET.Element) -> str:
-    """Extract visible text from one Word paragraph, including manual line breaks."""
-    parts: list[str] = []
-    for node in p.iter():
-        tag = node.tag.rsplit("}", 1)[-1]
-        if tag == "t":
-            parts.append(node.text or "")
-        elif tag == "tab":
-            parts.append(" ")
-        elif tag in {"br", "cr"}:
-            parts.append("\n")
-    return normalize_text("".join(parts))
+def is_metadata_line(text: str) -> bool:
+    return not text or text in {"新舊歌詞", "新舊歌 詞", "新舊歌  詞"}
 
 
-def extract_docx_lines(docx_path: Path) -> list[str]:
-    """Read paragraphs from a .docx using only Python standard library."""
-    with ZipFile(docx_path) as zf:
-        xml = zf.read("word/document.xml")
+def hymn_title(path: Path) -> str:
+    match = HYMNV_RE.search(path.stem)
+    if not match:
+        raise ValueError(f"Cannot find hymn number in file name: {path.name}")
+    return f"新聖詩{int(match.group(1))}首"
 
-    root = ET.fromstring(xml)
+
+def read_docx_lines(docx_path: Path) -> list[str]:
+    """Extract visible paragraph text from a DOCX file using the standard library."""
+    with zipfile.ZipFile(docx_path) as docx:
+        root = ET.fromstring(docx.read("word/document.xml"))
+
     lines: list[str] = []
-
-    # Reading all paragraphs also captures paragraphs inside Word tables.
-    for p in root.findall(".//w:p", NS):
-        text = paragraph_text(p)
-        if not text:
-            continue
-        for line in text.splitlines():
-            line = normalize_text(line)
-            if line:
-                lines.append(line)
-
+    for para in root.findall(".//w:p", W_NS):
+        text = "".join(node.text or "" for node in para.findall(".//w:t", W_NS))
+        text = normalize_line(text)
+        if text and not is_metadata_line(text):
+            lines.append(text)
     return lines
 
 
-def looks_like_metadata(line: str) -> bool:
-    """Skip document-level headers/footers that are not song text."""
-    bad_patterns = [
-        r"^新聖詩歌詞",
-        r"^目錄$",
-        r"^頁\s*\d+$",
-        r"^\d+\s*/\s*\d+$",
-    ]
-    return any(re.search(pattern, line) for pattern in bad_patterns)
-
-
-def parse_song_heading(line: str) -> tuple[int, str] | None:
-    """
-    Try to detect a hymn heading.
-
-    Accepted examples:
-      001 主上帝創造天地
-            001 131 1.聖哉,聖哉,聖哉3,
-
-        The source Word files use three-digit hymn numbers at the start of each song.
-        Do not treat stanza lyrics like "2.聖哉..." as a new song.
-    """
-    line = normalize_text(line)
-
-    patterns = [
-        r"^(\d{3})#?(?:\s+(.+))?$",
-    ]
-    for pattern in patterns:
-        match = re.match(pattern, line)
-        if not match:
-            continue
-        number = int(match.group(1))
-        title = normalize_text(match.group(2) or "")
-        # Remove the old hymn number column when present, e.g.
-        # "131 1.聖哉..." -> "1.聖哉..." and "62A 1.上帝..." -> "1.上帝...".
-        old_number = re.match(r"^(\d{1,3}[A-Z]?)(?:\s+(.+))?$", title, re.IGNORECASE)
-        if old_number:
-            title = normalize_text(old_number.group(2) or "")
-        if 1 <= number <= 999:
-            return number, title
-    return None
-
-
-def split_songs(lines: Iterable[str]) -> list[Song]:
-    songs: list[Song] = []
-    current: Song | None = None
-    previous_number = 0
-
-    for raw_line in lines:
-        line = normalize_text(raw_line)
-        if not line or looks_like_metadata(line):
-            continue
-
-        heading = parse_song_heading(line)
-        if heading:
-            number, title = heading
-            if number > previous_number:
-                current = Song(number=number, title=title, lines=[title] if title else [])
-                songs.append(current)
-                previous_number = number
-                continue
-            if previous_number == 0:
-                current = Song(number=number, title=title, lines=[title] if title else [])
-                songs.append(current)
-                previous_number = number
-                continue
-
-        if current is not None:
-            current.lines.append(line)
-
-    return songs
-
-
-def is_stanza_marker(line: str) -> bool:
-    """Detect stanza labels that should start a new slide."""
+def looks_like_lyric_start(text: str) -> bool:
     return bool(
-        re.match(r"^(?:\(?\d{1,2}\)?|[一二三四五六七八九十]+)\s*[.．、:：]?\s*$", line)
-        or re.match(r"^(?:第\s*)?[一二三四五六七八九十\d]{1,3}\s*(?:節|段)\s*[:：]?$", line)
-        or re.match(r"^(?:副歌|和|阿們|Amen)\s*[:：]?$", line, re.IGNORECASE)
+        re.match(r"^1\s*(?:[.．、:：-]|$)", text)
+        or re.match(r"^(?:台語|華語|客語)\b", text)
+        or re.match(r"^[^0-9]", text)
     )
 
 
-def starts_with_stanza_number(line: str) -> bool:
-    """Detect lyrics like '1. 主上帝...' where stanza marker and lyric are on same line."""
-    return bool(re.match(r"^(?:\(?\d{1,2}\)?|[一二三四五六七八九十]+)\s*[.．、:：]\s*\S+", line))
+def strip_old_hymn_number(text: str) -> str:
+    """Remove the old-hymnal number column from a DOCX heading remainder."""
+    text = text.lstrip("# ")
+    candidates: list[tuple[int, str]] = []
+    for digit_count in range(1, min(3, len(text)) + 1):
+        token = text[:digit_count]
+        if not token.isdigit():
+            break
+        end = digit_count
+        if end < len(text) and text[end].isalpha() and text[end].isascii():
+            end += 1
+        remainder = text[end:].strip()
+        if remainder and looks_like_lyric_start(remainder):
+            candidates.append((end, remainder))
+
+    if candidates:
+        return max(candidates, key=lambda item: item[0])[1]
+    return text.strip()
 
 
-def make_slides(song: Song, max_lines_per_slide: int = 6) -> list[list[str]]:
-    """Split one song into slides. Blank line between slides is ProPresenter-friendly."""
-    slides: list[list[str]] = []
+def parse_docx_heading(line: str) -> tuple[int, str] | None:
+    match = DOCX_HEADING_RE.match(line)
+    if not match:
+        return None
+    number = int(match.group(1))
+    if not 1 <= number <= 650:
+        return None
+    first_line = strip_old_hymn_number(match.group(2))
+    return number, first_line
+
+
+def load_docx_songs(docs_dir: Path) -> list[Song]:
+    docx_files = sorted(docs_dir.glob("*.docx"))
+    if not docx_files:
+        raise FileNotFoundError(f"No .docx files found in {docs_dir}")
+
+    songs: dict[int, Song] = {}
+    current: Song | None = None
+    for docx_path in docx_files:
+        for line in read_docx_lines(docx_path):
+            heading = parse_docx_heading(line)
+            if heading:
+                number, first_line = heading
+                current = songs.setdefault(number, Song(number=number, lines=[]))
+                if first_line:
+                    current.lines.append(first_line)
+                continue
+            if current is not None:
+                current.lines.append(line)
+
+    return [songs[number] for number in sorted(songs)]
+
+
+def starts_new_docx_block(line: str) -> bool:
+    return bool(
+        re.match(r"^(?:\d{1,2}(?:-\d+)?\s*[.．、:：]|【(?:複歌|副歌|尾聲)|(?:複歌|副歌))", line)
+        or re.match(r"^(?:台語|華語|客語)\s*\d{0,2}\s*[.．、:：]", line)
+    )
+
+
+def docx_blocks(lines: list[str]) -> list[str]:
+    blocks: list[str] = []
     current: list[str] = []
-
-    def flush() -> None:
-        nonlocal current
-        if current:
-            slides.append(current)
-            current = []
-
-    for line in song.lines:
-        line = normalize_text(line)
+    for line in lines:
+        line = normalize_line(line)
         if not line:
-            flush()
             continue
-
-        if is_stanza_marker(line):
-            flush()
-            current.append(line)
-            continue
-
-        if starts_with_stanza_number(line):
-            flush()
-            current.append(line)
-            continue
-
+        if current and starts_new_docx_block(line):
+            blocks.append("\n".join(current))
+            current = []
         current.append(line)
-        if max_lines_per_slide > 0 and len(current) >= max_lines_per_slide:
-            flush()
-
-    flush()
-
-    if not slides and song.lines:
-        slides = [song.lines]
-    return slides
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
 
 
-def safe_filename(name: str) -> str:
-    name = normalize_text(name)
-    name = re.sub(r"[\\/:*?\"<>|]", "-", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:120]
+def write_song_txt(song: Song, output_dir: Path, overwrite: bool) -> Path:
+    output_path = output_dir / f"{song.title}.txt"
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"Output exists; use --overwrite: {output_path}")
+
+    content = song.title + "\n\n"
+    blocks = docx_blocks(song.lines)
+    if blocks:
+        content += "\n\n".join(blocks).rstrip() + "\n"
+    output_path.write_text(content, encoding="utf-8")
+    return output_path
 
 
-def write_song_txt(song: Song, output_dir: Path, max_lines_per_slide: int, overwrite: bool) -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    filename = safe_filename(f"新聖詩{song.number}首.txt")
-    out_path = output_dir / filename
-
-    if out_path.exists() and not overwrite:
-        raise FileExistsError(f"檔案已存在，請加 --overwrite 覆蓋：{out_path}")
-
-    slides = make_slides(song, max_lines_per_slide=max_lines_per_slide)
-
-    # 第一行是歌名；之後用空白行分隔每張投影片。
-    blocks = [song.display_title]
-    blocks.extend("\n".join(slide) for slide in slides if slide)
-    text = "\n\n".join(blocks).strip() + "\n"
-    out_path.write_text(text, encoding="utf-8")
-    return out_path
+def slide_number(path_in_zip: str) -> int:
+    match = SLIDE_RE.search(Path(path_in_zip).name)
+    if not match:
+        return 0
+    return int(match.group(1))
 
 
-def convert(inputs: list[Path], output_dir: Path, max_lines_per_slide: int, overwrite: bool) -> list[Path]:
-    all_songs: list[Song] = []
+def textbox_y(shape: ET.Element) -> int:
+    off = shape.find(".//a:off", NS)
+    if off is None:
+        return 0
+    try:
+        return int(off.attrib.get("y", "0"))
+    except ValueError:
+        return 0
 
-    for docx_path in inputs:
-        if not docx_path.exists():
-            print(f"找不到檔案，略過：{docx_path}", file=sys.stderr)
+
+def shape_paragraphs(shape: ET.Element) -> list[str]:
+    paragraphs: list[str] = []
+    text_body = shape.find("p:txBody", NS)
+    if text_body is None:
+        return paragraphs
+
+    for para in text_body.findall("a:p", NS):
+        text = "".join(node.text or "" for node in para.findall(".//a:t", NS))
+        text = normalize_line(text)
+        if not text:
             continue
-        lines = extract_docx_lines(docx_path)
-        songs = split_songs(lines)
-        print(f"{docx_path.name}: 找到 {len(songs)} 首")
-        all_songs.extend(songs)
-
-    # 若兩個 Word 檔有重複編號，保留後面檔案最後讀到的版本。
-    by_number: dict[int, Song] = {song.number: song for song in all_songs}
-    songs_sorted = [by_number[number] for number in sorted(by_number)]
-
-    written: list[Path] = []
-    for song in songs_sorted:
-        written.append(write_song_txt(song, output_dir, max_lines_per_slide, overwrite))
-
-    return written
+        # PPT footers are usually appended as their own paragraph, for example:
+        # 新聖詩101首（1/3）舊131首
+        if FOOTER_RE.search(text):
+            continue
+        paragraphs.append(text)
+    return paragraphs
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="把新聖詩 Word 歌詞檔轉成 ProPresenter 可逐首匯入的 UTF-8 txt。"
+def slide_texts(pptx_path: Path) -> list[str]:
+    blocks: list[str] = []
+    with zipfile.ZipFile(pptx_path) as deck:
+        slide_paths = sorted(
+            (
+                name
+                for name in deck.namelist()
+                if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+            ),
+            key=slide_number,
+        )
+
+        for slide_path in slide_paths:
+            root = ET.fromstring(deck.read(slide_path))
+            boxes: list[TextBox] = []
+            for index, shape in enumerate(root.findall(".//p:sp", NS)):
+                paragraphs = shape_paragraphs(shape)
+                if paragraphs:
+                    boxes.append(TextBox(index=index, y=textbox_y(shape), paragraphs=paragraphs))
+
+            # Sort primarily by vertical position so verse labels placed above the
+            # main lyrics are emitted before lyrics; keep original shape order for
+            # text boxes on the same horizontal row.
+            boxes.sort(key=lambda box: (box.y, box.index))
+            lines = [line for box in boxes for line in box.paragraphs]
+            if lines:
+                blocks.append("\n".join(lines))
+    return blocks
+
+
+def convert_one_pptx(pptx_path: Path, output_dir: Path, overwrite: bool) -> Path:
+    title = hymn_title(pptx_path)
+    output_path = output_dir / f"{title}.txt"
+    if output_path.exists() and not overwrite:
+        raise FileExistsError(f"Output exists; use --overwrite: {output_path}")
+
+    blocks = slide_texts(pptx_path)
+    content = title + "\n\n"
+    if blocks:
+        content += "\n\n".join(blocks).rstrip() + "\n"
+
+    output_path.write_text(content, encoding="utf-8")
+    return output_path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--source",
+        choices=("docs", "ppt"),
+        default="docs",
+        help="Use complete DOCX lyrics from raw_data/新聖詩/Docs, or PPTX files from raw_data/新聖詩/PPT.",
     )
     parser.add_argument(
-        "inputs",
-        nargs="*",
+        "--docs-dir",
         type=Path,
-        default=[Path(name) for name in DEFAULT_INPUTS],
-        help="要轉換的 .docx 檔；預設為新聖詩歌詞1-300.docx 與 新聖詩歌詞301-650.docx。",
+        default=Path("raw_data/新聖詩/Docs"),
+        help="Directory containing complete 新聖詩 .docx lyric files.",
     )
     parser.add_argument(
-        "-o",
-        "--output",
+        "--ppt-dir",
         type=Path,
-        default=Path(DEFAULT_OUTPUT),
-        help=f"輸出資料夾；預設：{DEFAULT_OUTPUT}",
+        default=Path("raw_data/新聖詩/PPT"),
+        help="Directory containing 新聖詩 .pptx files.",
     )
     parser.add_argument(
-        "--max-lines-per-slide",
-        type=int,
-        default=6,
-        help="每張投影片最多幾行；0 表示只照節數分頁，不再按行數切。預設：6",
+        "--output-dir",
+        type=Path,
+        default=Path("transform_data/新聖詩"),
+        help="Directory where .txt files will be written.",
     )
     parser.add_argument(
-        "--overwrite",
+        "--clean-output",
         action="store_true",
-        help="覆蓋已存在的 txt 檔。",
+        help="Delete existing 新聖詩*.txt files in the output directory before converting.",
     )
-    return parser
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing .txt files.")
+    args = parser.parse_args(argv)
 
+    output_dir = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.clean_output:
+        for existing_path in output_dir.glob("新聖詩*首.txt"):
+            existing_path.unlink()
 
-def main() -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args()
+    converted: list[Path] = []
+    if args.source == "docs":
+        songs = load_docx_songs(args.docs_dir)
+        for song in songs:
+            converted.append(write_song_txt(song, output_dir, args.overwrite))
+        print(f"Converted {len(converted)} DOCX songs to {output_dir}")
+        return 0
 
-    written = convert(
-        inputs=args.inputs,
-        output_dir=args.output,
-        max_lines_per_slide=args.max_lines_per_slide,
-        overwrite=args.overwrite,
-    )
+    pptx_files = sorted(args.ppt_dir.glob("*.pptx"), key=lambda path: hymn_title(path))
+    if not pptx_files:
+        print(f"No .pptx files found in {args.ppt_dir}", file=sys.stderr)
+        return 1
 
-    print(f"完成：輸出 {len(written)} 個 txt 檔到 {args.output.resolve()}")
-    if written:
-        print(f"範例：{written[0].name}")
+    for pptx_path in pptx_files:
+        converted.append(convert_one_pptx(pptx_path, output_dir, args.overwrite))
+
+    print(f"Converted {len(converted)} PPTX files to {output_dir}")
     return 0
 
 
